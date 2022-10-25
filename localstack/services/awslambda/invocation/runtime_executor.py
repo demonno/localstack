@@ -5,8 +5,7 @@ from typing import Type
 from plugin import PluginManager
 
 from localstack import config
-from localstack.aws.api.lambda_ import FunctionVersion
-from localstack.services.awslambda.invocation.lambda_models import ServiceEndpoint
+from localstack.services.awslambda.invocation.lambda_models import FunctionVersion, ServiceEndpoint
 from localstack.services.awslambda.invocation.plugins import RuntimeExecutorPlugin
 
 LOG = logging.getLogger(__name__)
@@ -60,6 +59,15 @@ class RuntimeExecutor(ABC):
         Get the address of LocalStack the runtime execution environment can communicate with LocalStack
 
         :return: IP address or hostname of LocalStack (from the view of the execution environment)
+        """
+        pass
+
+    @abstractmethod
+    def get_runtime_endpoint(self) -> str:
+        """
+        Gets the callback url of our executor endpoint
+
+        :return: Base url of the callback, e.g. "http://123.123.123.123:4566/_localstack_lambda/ID1234" without trailing slash
         """
         pass
 

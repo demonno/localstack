@@ -126,6 +126,9 @@ from localstack.aws.api.lambda_ import (
     Version,
 )
 from localstack.services.awslambda import api_utils
+from localstack.services.awslambda.event_source_listeners.event_source_listener import (
+    EventSourceListener,
+)
 from localstack.services.awslambda.invocation.lambda_models import (
     IMAGE_MAPPING,
     LAMBDA_LIMITS_CREATE_FUNCTION_REQUEST_SIZE,
@@ -154,11 +157,13 @@ from localstack.services.awslambda.invocation.lambda_models import (
 )
 from localstack.services.awslambda.invocation.lambda_service import (
     LambdaService,
+    destroy_code_if_not_used,
     lambda_stores,
     store_lambda_archive,
     store_s3_bucket_archive,
 )
 from localstack.services.awslambda.invocation.models import LambdaStore
+from localstack.services.awslambda.lambda_utils import validate_filters
 from localstack.services.plugins import ServiceLifecycleHook
 from localstack.utils.collections import PaginatedList
 from localstack.utils.strings import get_random_hex, long_uid, short_uid, to_bytes, to_str
@@ -220,7 +225,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
         # TODO what if version is missing?
         return version
 
-    def _publish_version(
+    def _create_version_model(
         self,
         function_name: str,
         region: str,
@@ -228,7 +233,24 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
         description: str | None = None,
         revision_id: str | None = None,
         code_sha256: str | None = None,
-    ):
+    ) -> tuple[FunctionVersion, bool]:
+        """
+        Release a new version to the model if all restrictions are met.
+        Restrictions:
+          - CodeSha256, if provided, must equal the current latest version code hash
+          - RevisionId, if provided, must equal the current latest version revision id
+          - Some changes have been done to the latest version since last publish
+        Will return a tuple of the version, and whether the version was published (True) or the latest available version was taken (False).
+        This can happen if the latest version has not been changed since the last version publish, in this case the last version will be returned.
+
+        :param function_name: Function name to be published
+        :param region: Region of the function
+        :param account_id: Account of the function
+        :param description: new description of the version (will be the description of the function if missing)
+        :param revision_id: Revision id, function will raise error if it does not match latest revision id
+        :param code_sha256: Code sha256, function will raise error if it does not match latest code hash
+        :return: Tuple of (published version, whether version was released or last released version returned, since nothing changed)
+        """
         current_latest_version = self._get_function_version(
             function_name=function_name, qualifier="$LATEST", account_id=account_id, region=region
         )
@@ -258,7 +280,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
                     prev_version.config.internal_revision
                     == current_latest_version.config.internal_revision
                 ):
-                    return prev_version
+                    return prev_version, False
             # TODO check if there was a change since last version
             next_version = str(function.next_version)
             function.next_version += 1
@@ -272,11 +294,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
                 current_latest_version,
                 config=dataclasses.replace(
                     current_latest_version.config,
-                    last_update=UpdateStatus(
-                        status=LastUpdateStatus.InProgress,
-                        code="Creating",
-                        reason="The function is being created.",
-                    ),
+                    last_update=None,  # versions never have a last update status
                     state=VersionState(
                         state=State.Pending,
                         code=StateReasonCode.Creating,
@@ -287,6 +305,73 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
                 id=new_id,
             )
             function.versions[next_version] = new_version
+        return new_version, True
+
+    def _publish_version_from_existing_version(
+        self,
+        function_name: str,
+        region: str,
+        account_id: str,
+        description: str | None = None,
+        revision_id: str | None = None,
+        code_sha256: str | None = None,
+    ) -> FunctionVersion:
+        """
+        Publish version from an existing, already initialized LATEST
+
+        :param function_name: Function name
+        :param region: region
+        :param account_id: account id
+        :param description: description
+        :param revision_id: revision id (check if current version matches)
+        :param code_sha256: code sha (check if current code matches)
+        :return: new version
+        """
+        new_version, changed = self._create_version_model(
+            function_name=function_name,
+            region=region,
+            account_id=account_id,
+            description=description,
+            revision_id=revision_id,
+            code_sha256=code_sha256,
+        )
+        if not changed:
+            return new_version
+        self.lambda_service.publish_version(new_version)
+        state = lambda_stores[account_id][region]
+        function = state.functions.get(function_name)
+        return function.versions.get(new_version.id.qualifier)
+
+    def _publish_version_with_changes(
+        self,
+        function_name: str,
+        region: str,
+        account_id: str,
+        description: str | None = None,
+        revision_id: str | None = None,
+        code_sha256: str | None = None,
+    ) -> FunctionVersion:
+        """
+        Publish version together with a new latest version (publish on create / update)
+
+        :param function_name: Function name
+        :param region: region
+        :param account_id: account id
+        :param description: description
+        :param revision_id: revision id (check if current version matches)
+        :param code_sha256: code sha (check if current code matches)
+        :return: new version
+        """
+        new_version, changed = self._create_version_model(
+            function_name=function_name,
+            region=region,
+            account_id=account_id,
+            description=description,
+            revision_id=revision_id,
+            code_sha256=code_sha256,
+        )
+        if not changed:
+            return new_version
         self.lambda_service.create_function_version(new_version)
         return new_version
 
@@ -389,6 +474,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
                     ephemeral_storage=LambdaEphemeralStorage(
                         size=request.get("EphemeralStorage", {}).get("Size", 512)
                     ),
+                    dead_letter_arn=request.get("DeadLetterConfig", {}).get("TargetArn"),
                     state=VersionState(
                         state=State.Pending,
                         code=StateReasonCode.Creating,
@@ -404,7 +490,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
         self.lambda_service.create_function_version(version)
 
         if request.get("Publish"):
-            version = self._publish_version(
+            version = self._publish_version_with_changes(
                 function_name=function_name, region=context.region, account_id=context.account_id
             )
 
@@ -454,6 +540,9 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
 
         if "MemorySize" in request:
             replace_kwargs["memory_size"] = request["MemorySize"]
+
+        if "DeadLetterConfig" in request:
+            replace_kwargs["dead_letter_arn"] = request.get("DeadLetterConfig", {}).get("TargetArn")
 
         if "Runtime" in request:
             if request["Runtime"] not in IMAGE_MAPPING:
@@ -542,7 +631,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
 
         self.lambda_service.update_version(new_version=function_version)
         if request.get("Publish"):
-            function_version = self._publish_version(
+            function_version = self._publish_version_with_changes(
                 function_name=function_name, region=context.region, account_id=context.account_id
             )
         return api_utils.map_config_out(
@@ -583,6 +672,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
             version = function.versions.pop(qualifier, None)
             if version:
                 self.lambda_service.stop_version(version.qualified_arn())
+                destroy_code_if_not_used(code=version.config.code, function=function)
         else:
             # delete the whole function
             function = state.functions.pop(function_name)
@@ -744,7 +834,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
         revision_id: String = None,
     ) -> FunctionConfiguration:
         function_name = api_utils.get_function_name(function_name, context.region)
-        new_version = self._publish_version(
+        new_version = self._publish_version_from_existing_version(
             function_name=function_name,
             description=description,
             account_id=context.account_id,
@@ -978,11 +1068,9 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
         # TODO: create domain models and map accordingly
         params = request.copy()
         params.pop("FunctionName")
-        params["State"] = "Enabled"  # TODO: should be set asynchronously
-        # params["State"] = "Creating"
+        params["State"] = "Enabled"
         params["StateTransitionReason"] = "USER_INITIATED"
         params["UUID"] = new_uuid
-        params["BatchSize"] = request.get("BatchSize", 10)
         params["FunctionResponseTypes"] = request.get("FunctionResponseTypes", [])
         params["MaximumBatchingWindowInSeconds"] = request.get("MaximumBatchingWindowInSeconds", 0)
         params["LastModified"] = api_utils.generate_lambda_date()
@@ -990,9 +1078,33 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
             request["FunctionName"], context.account_id, context.region
         )
 
+        batch_size = api_utils.validate_and_set_batch_size(
+            request["EventSourceArn"], request.get("BatchSize")
+        )
+
+        if batch_size > 10 and request.get("MaximumBatchingWindowInSeconds", 0) == 0:
+            raise InvalidParameterValueException(
+                "Maximum batch window in seconds must be greater than 0 if maximum batch size is greater than 10",
+                Type="User",
+            )
+
+        params["BatchSize"] = batch_size
+
         esm_config = EventSourceMappingConfiguration(**params)
+        filter_criteria = esm_config.get("FilterCriteria")
+        if filter_criteria:
+            # validate for valid json
+            if not validate_filters(filter_criteria):
+                raise InvalidParameterValueException(
+                    "Invalid filter pattern definition.", Type="User"
+                )  # TODO: verify
+
         state.event_source_mappings[new_uuid] = esm_config
-        return esm_config
+
+        # TODO: evaluate after temp migration
+        EventSourceListener.start_listeners_for_asf(request, self.lambda_service)
+
+        return {**esm_config, "State": "Creating"}  # TODO: should be set asynchronously
 
     @handler("UpdateEventSourceMapping", expand=False)
     def update_event_source_mapping(
@@ -1003,6 +1115,17 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
         state = lambda_stores[context.account_id][context.region]
         uuid = request["UUID"]
         event_source_mapping = state.event_source_mappings.get(uuid)
+
+        if request.get("BatchSize"):
+            batch_size = api_utils.validate_and_set_batch_size(
+                event_source_mapping["EventSourceArn"], request["BatchSize"]
+            )
+            if batch_size > 10 and request.get("MaximumBatchingWindowInSeconds", 0) == 0:
+                raise InvalidParameterValueException(
+                    "Maximum batch window in seconds must be greater than 0 if maximum batch size is greater than 10",
+                    Type="User",
+                )
+
         if not event_source_mapping:
             raise ResourceNotFoundException(
                 "The resource you requested does not exist.", Type="User"

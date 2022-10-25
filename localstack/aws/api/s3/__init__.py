@@ -198,6 +198,7 @@ class BucketCannedACL(str):
     public_read = "public-read"
     public_read_write = "public-read-write"
     authenticated_read = "authenticated-read"
+    log_delivery_write = "log-delivery-write"
 
 
 class BucketLocationConstraint(str):
@@ -209,6 +210,7 @@ class BucketLocationConstraint(str):
     ap_south_1 = "ap-south-1"
     ap_southeast_1 = "ap-southeast-1"
     ap_southeast_2 = "ap-southeast-2"
+    ap_southeast_3 = "ap-southeast-3"
     ca_central_1 = "ca-central-1"
     cn_north_1 = "cn-north-1"
     cn_northwest_1 = "cn-northwest-1"
@@ -693,6 +695,13 @@ class AuthorizationQueryParametersError(ServiceException):
 
 class NoSuchWebsiteConfiguration(ServiceException):
     code: str = "NoSuchWebsiteConfiguration"
+    sender_fault: bool = False
+    status_code: int = 404
+    BucketName: Optional[BucketName]
+
+
+class ReplicationConfigurationNotFoundError(ServiceException):
+    code: str = "ReplicationConfigurationNotFoundError"
     sender_fault: bool = False
     status_code: int = 404
     BucketName: Optional[BucketName]
